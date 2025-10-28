@@ -13,6 +13,13 @@ const DEFAULT_DIR = 'sur_norte';
 
 // ======= HELPERS =======
 const normId = (v) => String(v ?? '').trim().toLowerCase();
+function toRad(d){ return d*Math.PI/180; }
+function haversineMeters(a,b){
+  const R=6371000;
+  const dLat=toRad(b.lat-a.lat), dLon=toRad(b.lon-a.lon);
+  const s= Math.sin(dLat/2)**2 + Math.cos(toRad(a.lat))*Math.cos(toRad(b.lat))*Math.sin(dLon/2)**2;
+  return 2*R*Math.asin(Math.sqrt(s));
+}
 
 // ======= RUTAS =======
 const LINES = {
@@ -100,14 +107,12 @@ const LINES = {
 const deviceState = new Map();  // deviceId -> { lineId, dir, lastLat, lastLon, lastSeen, sats, hdop, speedKmh, alt, lastStop... }
 const segmentStats = new Map(); // `${line}|${dir}|${a}->${b}` -> { count, avgSec }
 
+// Historial de recorrido (en memoria)
+const tracks = new Map();       // deviceId -> [{lat, lon, t}]
+const TRACK_MAX_POINTS = 2000;  // últimos N puntos
+const TRACK_TTL_MS     = 2 * 60 * 60 * 1000; // 2h
+
 // ======= UTIL =======
-function toRad(d){ return d*Math.PI/180; }
-function haversineMeters(a,b){
-  const R=6371000;
-  const dLat=toRad(b.lat-a.lat), dLon=toRad(b.lon-a.lon);
-  const s= Math.sin(dLat/2)**2 + Math.cos(toRad(a.lat))*Math.cos(toRad(b.lat))*Math.sin(dLon/2)**2;
-  return 2*R*Math.asin(Math.sqrt(s));
-}
 function getStops(lineId, dir){
   const L = LINES[normId(lineId)];
   if(!L) return null;
@@ -136,11 +141,19 @@ function nearestStopInLine(lineId, dir, lat, lon){
     const d = haversineMeters(here,s);
     if(!best || d<best.distance) best = {...s, distance:d};
   }
-  return best; // {id,name,lat,lon,distance}
+  return best;
+}
+function pushTrack(deviceId, lat, lon){
+  const now = Date.now();
+  let arr = tracks.get(deviceId);
+  if(!arr){ arr = []; tracks.set(deviceId, arr); }
+  arr.push({ lat: Number(lat), lon: Number(lon), t: now });
+  if(arr.length > TRACK_MAX_POINTS) arr.splice(0, arr.length - TRACK_MAX_POINTS);
+  const limit = now - TRACK_TTL_MS;
+  while(arr.length && arr[0].t < limit) arr.shift();
 }
 
 // ======= ENDPOINTS =======
-
 app.get('/',(req,res)=>{
   res.send(`
     <h2>Servidor IoT Metropolitano ✅</h2>
@@ -151,7 +164,7 @@ app.get('/',(req,res)=>{
   `);
 });
 
-// UI del conductor con panel de estado
+// UI del conductor con panel de estado + recorrido
 app.get('/driver', (req, res) => {
   const lineIds = Object.keys(LINES);
   const dirsByLine = Object.fromEntries(lineIds.map(id => [id, Object.keys(LINES[id])]));
@@ -198,6 +211,10 @@ app.get('/driver', (req, res) => {
     <div id="msg" class="muted"></div>
 
     <hr/>
+    <h3>Opciones del mapa</h3>
+    <label><input type="checkbox" id="showtrack" checked/> Mostrar recorrido</label>
+
+    <hr/>
     <h3>Estado en vivo</h3>
     <div class="kpi">
       <div><strong>Device:</strong> <span id="kDevice" class="muted">—</span></div>
@@ -228,6 +245,7 @@ app.get('/driver', (req, res) => {
   const $kLatLon = document.getElementById('kLatLon');
   const $kAgo    = document.getElementById('kAgo');
   const $kStop   = document.getElementById('kStop');
+  const $showtrack = document.getElementById('showtrack');
 
   function fillLines(selected){
     $line.innerHTML='';
@@ -288,7 +306,7 @@ app.get('/driver', (req, res) => {
     maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
   }).addTo(map);
 
-  let stopsMarkers=[]; let polyLine=null; let deviceMarker=null;
+  let stopsMarkers=[]; let polyLine=null; let deviceMarker=null; let trackLine=null;
 
   async function loadStopsAndDraw(lineId, dir){
     try{
@@ -318,14 +336,20 @@ app.get('/driver', (req, res) => {
     return s+' s';
   }
 
-  async function poll(){
+  function drawTrack(points){
+    if(trackLine){ trackLine.remove(); trackLine=null; }
+    if(!$showtrack.checked || !points || points.length<2) return;
+    const latlngs = points.map(p => [p.lat, p.lon]);
+    trackLine = L.polyline(latlngs, { weight:3, opacity:0.7 }).addTo(map);
+  }
+
+  async function pollDevice(){
     const id = ($dev.value.trim() || 'unknown');
     try{
       const r = await fetch('/device?deviceId='+encodeURIComponent(id));
       const d = await r.json();
       if(!d.found) return;
 
-      // Actualizar KPIs
       $kDevice.textContent = id;
       $kLineDir.textContent = (d.lineId||'—')+' / '+(d.dir||'—');
       if(typeof d.lastLat==='number' && typeof d.lastLon==='number'){
@@ -344,9 +368,19 @@ app.get('/driver', (req, res) => {
     }catch(e){}
   }
 
+  async function pollTrack(){
+    const id = ($dev.value.trim() || 'unknown');
+    try{
+      const r = await fetch('/track?deviceId='+encodeURIComponent(id)+'&minutes=60');
+      const data = await r.json();
+      drawTrack(data);
+    }catch(e){}
+  }
+
   // Inicial
   loadStopsAndDraw($line.value, $dir.value);
-  setInterval(poll, 2000);
+  setInterval(pollDevice, 2000);
+  setInterval(pollTrack, 5000);
 </script>
 </body></html>`);
 });
@@ -363,6 +397,19 @@ app.get('/stops', (req,res)=>{
   const stops=L[normId(dir)];
   if(!stops) return res.status(400).json({error:'dir inválida'});
   res.json({ lineId:normId(lineId), dir:normId(dir), stops });
+});
+
+// Track (recorrido reciente)
+app.get('/track', (req,res)=>{
+  const id = (req.query.deviceId || '').toString();
+  if(!id) return res.status(400).json({error:'deviceId requerido'});
+  const arr = tracks.get(id) || [];
+  const minutes = Number(req.query.minutes || 0);
+  if(minutes>0){
+    const cutoff = Date.now() - minutes*60*1000;
+    return res.json(arr.filter(p => p.t >= cutoff));
+  }
+  res.json(arr);
 });
 
 // Device quick state
@@ -412,7 +459,7 @@ app.post('/telemetry',(req,res)=>{
   if(speedKmh!==undefined) st.speedKmh=Number(speedKmh);
   st.lastSeen=Date.now();
 
-  // Geofencing
+  // Geofencing y promedios
   const near=nearestStopInLine(st.lineId, st.dir, st.lastLat, st.lastLon);
   if(near && near.distance<=GEOFENCE_RADIUS_M){
     if(st.lastStopId && normId(st.lastStopId)!==normId(near.id) && st.lastStopTime){
@@ -421,6 +468,9 @@ app.post('/telemetry',(req,res)=>{
     }
     st.lastStopId=near.id; st.lastStopName=near.name; st.lastStopTime=Date.now();
   }
+
+  // Guardar punto en track
+  pushTrack(deviceId, st.lastLat, st.lastLon);
 
   deviceState.set(deviceId,st);
   res.sendStatus(200);
