@@ -1,7 +1,10 @@
 // server.js
 const express = require('express');
+const cors = require('cors');
 const app = express();
+
 app.use(express.json());
+app.use(cors()); // útil si sirves la UI desde otro origen
 
 // ======= CONFIG =======
 const GEOFENCE_RADIUS_M = 60;          // radio para considerar “en paradero”
@@ -177,7 +180,24 @@ function estimateETA(lineId, dir, fromId, toId){
 
 // ======= ENDPOINTS =======
 
-// UI para el chofer: selección de línea y dirección
+// Home
+app.get('/',(req,res)=>{
+  res.send(`
+    <h2>Servidor IoT Metropolitano ✅</h2>
+    <p>Líneas: ${Object.keys(LINES).join(', ')}</p>
+    <ul>
+      <li><code>GET /driver</code> UI para el conductor (Leaflet)</li>
+      <li><code>POST /set-line</code> { deviceId, lineId, dir }</li>
+      <li><code>POST /telemetry</code> { deviceId, lat, lon, (opcional lineId, dir) }</li>
+      <li><code>GET /stops?line=troncal_c&dir=norte_sur</code></li>
+      <li><code>GET /device?deviceId=bus123</code></li>
+      <li><code>GET /state</code> estado dispositivos y promedios</li>
+      <li><code>GET /eta?line=expreso_1&dir=norte_sur&from=central&to=matellini</code></li>
+    </ul>
+  `);
+});
+
+// UI para el chofer: selección de línea y dirección + MAPA (Leaflet sin API key)
 app.get('/driver', (req, res) => {
   const q = req.query || {};
   const preDevice = (q.deviceId || '').toString();
@@ -185,50 +205,61 @@ app.get('/driver', (req, res) => {
   const lineIds = Object.keys(LINES);
   const dirsByLine = Object.fromEntries(lineIds.map(id => [id, Object.keys(LINES[id])]));
 
-  res.send(`
-<!doctype html>
+  res.send(`<!doctype html>
 <html lang="es">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Selección de Ruta - Conductor</title>
+  <title>Conductor | Selección + Mapa (Leaflet)</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
   <style>
-    body { font-family: system-ui, Arial, sans-serif; margin: 20px; }
-    .card { max-width: 520px; border: 1px solid #ddd; border-radius: 12px; padding: 16px; box-shadow: 0 2px 10px rgba(0,0,0,.04); }
-    label { display:block; margin: 12px 0 6px; font-weight: 600; }
+    *{box-sizing:border-box}
+    body { font-family: system-ui, Arial, sans-serif; margin: 0; }
+    header { padding: 12px 16px; background: #0d6efd; color: #fff; }
+    .wrap { display: grid; grid-template-columns: 360px 1fr; gap: 12px; padding: 12px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 14px; box-shadow: 0 2px 10px rgba(0,0,0,.04); }
+    label { display:block; margin: 10px 0 6px; font-weight: 600; }
     input, select { width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #ccc; }
-    button { margin-top: 14px; width: 100%; padding: 12px; border-radius: 10px; border: 0; background:#0d6efd; color:#fff; font-weight:700; cursor:pointer; }
-    button:disabled{ opacity:.5; }
-    .ok { color: #0a7c2f; margin-top: 10px; }
-    .err { color: #b00020; margin-top: 10px; }
-    .row { display:flex; gap:10px; }
-    .row > div { flex:1; }
+    button { margin-top: 12px; width: 100%; padding: 12px; border-radius: 10px; border: 0; background:#0d6efd; color:#fff; font-weight:700; cursor:pointer; }
+    button:disabled{ opacity:.6; }
+    #msg { margin-top:10px; min-height: 22px; }
+    .ok { color: #0a7c2f; }
+    .err { color: #b00020; }
+    #map { width: 100%; height: calc(100vh - 64px - 24px); border-radius: 12px; }
     small { color:#666; }
   </style>
 </head>
 <body>
-  <div class="card">
-    <h2>Seleccionar ruta y dirección</h2>
-    <p><small>El bus reportará telemetría con estos parámetros hasta que se cambien.</small></p>
+  <header><strong>Metropolitano — Panel del Conductor</strong></header>
+  <div class="wrap">
+    <div class="card">
+      <h3>Seleccionar ruta y dirección</h3>
+      <p><small>El bus reportará telemetría con estos parámetros hasta que se cambien.</small></p>
 
-    <label for="device">ID del vehículo (deviceId)</label>
-    <input id="device" placeholder="ej: bus123" value="${preDevice}" />
+      <label for="device">ID del vehículo (deviceId)</label>
+      <input id="device" placeholder="ej: bus123" value="${preDevice}" />
 
-    <div class="row">
-      <div>
-        <label for="line">Línea</label>
-        <select id="line"></select>
-      </div>
-      <div>
-        <label for="dir">Dirección</label>
-        <select id="dir"></select>
-      </div>
+      <label for="line">Línea</label>
+      <select id="line"></select>
+
+      <label for="dir">Dirección</label>
+      <select id="dir"></select>
+
+      <button id="save">Confirmar selección</button>
+      <div id="msg"></div>
+
+      <hr/>
+      <h4>Opciones del mapa</h4>
+      <label><input type="checkbox" id="autofocus" checked /> Seguir al vehículo en vivo</label>
+      <label><input type="checkbox" id="showpoly" checked /> Mostrar trazo de la línea</label>
     </div>
 
-    <button id="save">Confirmar selección</button>
-    <div id="msg"></div>
+    <div class="card">
+      <div id="map"></div>
+    </div>
   </div>
 
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
   <script>
     const dirsByLine = ${JSON.stringify(dirsByLine)};
     const DEFAULT_LINE_ID = ${JSON.stringify(DEFAULT_LINE_ID)};
@@ -239,6 +270,8 @@ app.get('/driver', (req, res) => {
     const $dev  = document.getElementById('device');
     const $btn  = document.getElementById('save');
     const $msg  = document.getElementById('msg');
+    const $autofocus = document.getElementById('autofocus');
+    const $showpoly  = document.getElementById('showpoly');
 
     function fillLines(selected){
       $line.innerHTML = '';
@@ -265,8 +298,12 @@ app.get('/driver', (req, res) => {
     fillDirs(initialLine, (dirsByLine[initialLine]||[]).includes(DEFAULT_DIR) ? DEFAULT_DIR : (dirsByLine[initialLine]||[])[0]);
 
     $line.addEventListener('change', ()=>{
-      const lineId = $line.value;
+      const lineId=$line.value;
       fillDirs(lineId, dirsByLine[lineId]?.[0]);
+      loadStopsAndDraw(lineId, $dir.value);
+    });
+    $dir.addEventListener('change', ()=>{
+      loadStopsAndDraw($line.value, $dir.value);
     });
 
     $btn.addEventListener('click', async ()=>{
@@ -274,35 +311,129 @@ app.get('/driver', (req, res) => {
       const deviceId = $dev.value.trim();
       const lineId   = $line.value;
       const dir      = $dir.value;
-
-      if(!deviceId){
-        $msg.textContent = 'Ingrese un deviceId'; $msg.className='err'; $btn.disabled=false; return;
-      }
-
+      if(!deviceId){ $msg.textContent='Ingrese un deviceId'; $msg.className='err'; $btn.disabled=false; return; }
       try{
         const r = await fetch('/set-line', {
           method:'POST',
-          headers: { 'Content-Type':'application/json' },
+          headers:{'Content-Type':'application/json'},
           body: JSON.stringify({ deviceId, lineId, dir })
         });
-        if(!r.ok){
-          const e = await r.json().catch(()=>({error:'Error desconocido'}));
-          throw new Error(e.error || ('HTTP '+r.status));
-        }
-        const data = await r.json();
-        $msg.textContent = '✅ Configurado: ' + JSON.stringify(data);
+        const body = await r.json().catch(()=>({}));
+        if(!r.ok) throw new Error(body.error || ('HTTP '+r.status));
+        $msg.textContent = '✅ Configurado para ' + deviceId + ' ('+body.lineId+' / '+body.dir+')';
         $msg.className='ok';
-      }catch(err){
-        $msg.textContent = '❌ ' + err.message;
+        loadStopsAndDraw(lineId, dir);
+      }catch(e){
+        $msg.textContent = '❌ ' + e.message;
         $msg.className='err';
       }finally{
         $btn.disabled=false;
       }
     });
+
+    // ====== LEAFLET MAP ======
+    let map = L.map('map').setView([-12.05749, -77.03599], 12);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    let stopsMarkers = [];
+    let polyLine = null;
+    let deviceMarker = null;
+
+    async function loadStopsAndDraw(lineId, dir){
+      try{
+        const r = await fetch('/stops?line='+encodeURIComponent(lineId)+'&dir='+encodeURIComponent(dir));
+        const data = await r.json();
+        if(!r.ok) throw new Error(data.error||('HTTP '+r.status));
+        drawStops(data.stops);
+      }catch(e){
+        console.error(e);
+      }
+    }
+
+    function drawStops(stops){
+      // limpia anteriores
+      stopsMarkers.forEach(m=>m.remove());
+      stopsMarkers = [];
+      if(polyLine){ polyLine.remove(); polyLine=null; }
+
+      const latlngs = [];
+      const bounds = L.latLngBounds();
+
+      stops.forEach((s, idx)=>{
+        const pos = [s.lat, s.lon];
+        latlngs.push(pos);
+        bounds.extend(pos);
+        const m = L.marker(pos, { title: s.name || s.id }).addTo(map);
+        m.bindPopup('<strong>'+ (s.name||s.id) +'</strong><br/><small>'+s.lat.toFixed(6)+', '+s.lon.toFixed(6)+'</small>');
+        stopsMarkers.push(m);
+      });
+
+      if($showpoly.checked && latlngs.length>1){
+        polyLine = L.polyline(latlngs, { weight: 4, opacity: 0.9 }).addTo(map);
+      }
+
+      if (latlngs.length) map.fitBounds(bounds.pad(0.2));
+    }
+
+    async function pollDevice(){
+      const id = $dev.value.trim();
+      if(!id) return;
+      try{
+        const r = await fetch('/device?deviceId='+encodeURIComponent(id));
+        const data = await r.json();
+        if(!data.found) return;
+        if(typeof data.lastLat!=='number' || typeof data.lastLon!=='number') return;
+
+        const pos = [data.lastLat, data.lastLon];
+        if(!deviceMarker){
+          deviceMarker = L.circleMarker(pos, { radius: 6 }).addTo(map).bindTooltip('Vehículo: '+id);
+        } else {
+          deviceMarker.setLatLng(pos);
+        }
+        if($autofocus.checked){
+          map.panTo(pos);
+        }
+      }catch(e){
+        // silencioso
+      }
+    }
+
+    // inicial
+    loadStopsAndDraw($line.value, $dir.value);
+    setInterval(pollDevice, 2500);
   </script>
 </body>
-</html>
-  `);
+</html>`);
+});
+
+// Paraderos de una línea/dirección (para la UI)
+app.get('/stops', (req, res) => {
+  const lineId = req.query.line || DEFAULT_LINE_ID;
+  const dir    = req.query.dir  || DEFAULT_DIR;
+  const L = LINES[normId(lineId)];
+  if (!L) return res.status(400).json({error:'line inválida'});
+  const stops = L[normId(dir)];
+  if (!stops) return res.status(400).json({error:'dir inválida'});
+  res.json({ lineId: normId(lineId), dir: normId(dir), stops });
+});
+
+// Devuelve estado de un solo device (para localizar en el mapa)
+app.get('/device', (req,res)=>{
+  const id = (req.query.deviceId || '').toString();
+  if(!id) return res.status(400).json({error:'deviceId requerido'});
+  const st = deviceState.get(id);
+  if(!st) return res.json({found:false});
+  res.json({
+    found:true,
+    deviceId:id,
+    lineId: st.lineId, dir: st.dir,
+    lastSeen: st.lastSeen ? new Date(st.lastSeen).toISOString() : null,
+    lastLat: st.lastLat, lastLon: st.lastLon,
+    lastStopId: st.lastStopId, lastStopName: st.lastStopName
+  });
 });
 
 // Asignar línea/dirección a un bus
@@ -330,10 +461,12 @@ app.post('/telemetry', (req,res)=>{
   if(lineId && LINES[normId(lineId)]) st.lineId = normId(lineId);
   if(dir && LINES[st.lineId]?.[normId(dir)]) st.dir = normId(dir);
 
-  st.lastLat = lat; st.lastLon = lon; st.lastSeen = Date.now();
+  st.lastLat = Number(lat);
+  st.lastLon = Number(lon);
+  st.lastSeen = Date.now();
   deviceState.set(deviceId, st);
 
-  const near = nearestStopInLine(st.lineId, st.dir, lat, lon);
+  const near = nearestStopInLine(st.lineId, st.dir, st.lastLat, st.lastLon);
   if(near && near.distance <= GEOFENCE_RADIUS_M){
     if(st.lastStopId && normId(st.lastStopId) !== normId(near.id) && st.lastStopTime){
       const dtSec = Math.max(1, Math.round((Date.now()-st.lastStopTime)/1000));
@@ -346,10 +479,10 @@ app.post('/telemetry', (req,res)=>{
   }
   deviceState.set(deviceId, st);
 
+  // Log compacto
   console.log('📡 RX', {
     deviceId, line: st.lineId, dir: st.dir,
-    lat: Number(lat.toFixed?.(6) ?? lat),
-    lon: Number(lon.toFixed?.(6) ?? lon),
+    lat: st.lastLat, lon: st.lastLon,
     snapped: near && near.distance<=GEOFENCE_RADIUS_M ? near.id : null,
     distM: near ? Math.round(near.distance) : null
   });
@@ -391,21 +524,6 @@ app.get('/eta',(req,res)=>{
   if(!r) return res.status(400).json({error:'paraderos inválidos u orden incorrecto'});
 
   res.json({ lineId: normId(lineId), dir: normId(dir), from: normId(from), to: normId(to), ...r });
-});
-
-// Home
-app.get('/',(req,res)=>{
-  res.send(`
-    <h2>Servidor IoT Metropolitano ✅</h2>
-    <p>Líneas: ${Object.keys(LINES).join(', ')}</p>
-    <ul>
-      <li><code>GET /driver</code> UI para el conductor</li>
-      <li><code>POST /set-line</code> { deviceId, lineId, dir }</li>
-      <li><code>POST /telemetry</code> { deviceId, lat, lon, (opcional lineId, dir) }</li>
-      <li><code>GET /state</code> estado dispositivos y promedios</li>
-      <li><code>GET /eta?line=expreso_1&dir=norte_sur&from=central&to=matellini</code></li>
-    </ul>
-  `);
 });
 
 // Start
