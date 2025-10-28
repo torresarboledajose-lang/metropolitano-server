@@ -1,9 +1,9 @@
 // server.js
 const express = require('express');
 const cors = require('cors');
-const app = express();
 
-app.use(express.json());
+const app = express();
+app.use(express.json({ limit: '100kb' }));
 app.use(cors());
 
 // ======= CONFIG =======
@@ -15,13 +15,13 @@ const DEFAULT_DIR = 'sur_norte';
 const normId = (v) => String(v ?? '').trim().toLowerCase();
 function toRad(d){ return d*Math.PI/180; }
 function haversineMeters(a,b){
-  const R=6371000;
-  const dLat=toRad(b.lat-a.lat), dLon=toRad(b.lon-a.lon);
-  const s= Math.sin(dLat/2)**2 + Math.cos(toRad(a.lat))*Math.cos(toRad(b.lat))*Math.sin(dLon/2)**2;
+  const R = 6371000;
+  const dLat = toRad(b.lat - a.lat), dLon = toRad(b.lon - a.lon);
+  const s = Math.sin(dLat/2)**2 + Math.cos(toRad(a.lat))*Math.cos(toRad(b.lat))*Math.sin(dLon/2)**2;
   return 2*R*Math.asin(Math.sqrt(s));
 }
 
-// ======= RUTAS =======
+// ======= RUTAS (líneas) =======
 const LINES = {
   troncal_c: {
     norte_sur: [
@@ -104,18 +104,16 @@ const LINES = {
 };
 
 // ======= ESTADO =======
-const deviceState = new Map();  // deviceId -> { lineId, dir, lastLat, lastLon, lastSeen, sats, hdop, speedKmh, alt, lastStop... }
-const segmentStats = new Map(); // `${line}|${dir}|${a}->${b}` -> { count, avgSec }
-
-// Historial de recorrido (en memoria)
-const tracks = new Map();       // deviceId -> [{lat, lon, t}]
-const TRACK_MAX_POINTS = 2000;  // últimos N puntos
-const TRACK_TTL_MS     = 2 * 60 * 60 * 1000; // 2h
+const deviceState = new Map();        // deviceId -> {...}
+const segmentStats = new Map();       // promedios de tramo
+const tracks = new Map();             // deviceId -> [{lat,lon,t}]
+const TRACK_MAX_POINTS = 2000;
+const TRACK_TTL_MS = 2 * 60 * 60 * 1000; // 2 horas
 
 // ======= UTIL =======
 function getStops(lineId, dir){
   const L = LINES[normId(lineId)];
-  if(!L) return null;
+  if (!L) return null;
   return L[normId(dir)] || null;
 }
 function stopIndex(stops, id){
@@ -126,298 +124,203 @@ function segKey(lineId, dir, aId, bId){
   return `${normId(lineId)}|${normId(dir)}|${normId(aId)}->${normId(bId)}`;
 }
 function updateSegmentAvg(lineId, dir, aId, bId, seconds){
-  const key = segKey(lineId,dir,aId,bId);
+  const key = segKey(lineId, dir, aId, bId);
   const row = segmentStats.get(key) || { count:0, avgSec:0 };
-  row.avgSec = (row.avgSec*row.count + seconds)/(row.count+1);
+  row.avgSec = (row.avgSec * row.count + seconds) / (row.count + 1);
   row.count += 1;
-  segmentStats.set(key,row);
+  segmentStats.set(key, row);
 }
 function nearestStopInLine(lineId, dir, lat, lon){
   const stops = getStops(lineId, dir);
-  if(!stops) return null;
-  const here = {lat,lon};
-  let best=null;
-  for(const s of stops){
-    const d = haversineMeters(here,s);
-    if(!best || d<best.distance) best = {...s, distance:d};
+  if (!stops) return null;
+  const here = { lat, lon };
+  let best = null;
+  for (const s of stops){
+    const d = haversineMeters(here, s);
+    if (!best || d < best.distance) best = { ...s, distance: d };
   }
   return best;
 }
 function pushTrack(deviceId, lat, lon){
   const now = Date.now();
   let arr = tracks.get(deviceId);
-  if(!arr){ arr = []; tracks.set(deviceId, arr); }
+  if (!arr){ arr = []; tracks.set(deviceId, arr); }
   arr.push({ lat: Number(lat), lon: Number(lon), t: now });
-  if(arr.length > TRACK_MAX_POINTS) arr.splice(0, arr.length - TRACK_MAX_POINTS);
+  if (arr.length > TRACK_MAX_POINTS) arr.splice(0, arr.length - TRACK_MAX_POINTS);
   const limit = now - TRACK_TTL_MS;
-  while(arr.length && arr[0].t < limit) arr.shift();
+  while (arr.length && arr[0].t < limit) arr.shift();
 }
 
 // ======= ENDPOINTS =======
-app.get('/',(req,res)=>{
-  res.send(`
-    <h2>Servidor IoT Metropolitano ✅</h2>
-    <ul>
-      <li><a href="/driver">/driver</a> – Panel del conductor (ID, línea, dirección, mapa y estado en vivo)</li>
-      <li><a href="/state">/state</a> – Estado general</li>
-    </ul>
-  `);
+app.get('/', (req, res) => {
+  res.send(`<h2>Servidor IoT Metropolitano ✅</h2>
+  <ul>
+    <li><a href="/driver">/driver</a> – Panel del conductor (ID, línea, dirección, mapa, estado y recorrido)</li>
+    <li><a href="/state">/state</a> – Estado general</li>
+  </ul>`);
 });
 
-// UI del conductor con panel de estado + recorrido
+// UI del conductor
 app.get('/driver', (req, res) => {
   const lineIds = Object.keys(LINES);
   const dirsByLine = Object.fromEntries(lineIds.map(id => [id, Object.keys(LINES[id])]));
+  const pre = (req.query.deviceId || '').toString();
 
-  res.send(`<!doctype html>
-<html lang="es">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Panel del Conductor</title>
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
-<style>
-  *{box-sizing:border-box}
-  body{font-family:system-ui,Arial;margin:0;background:#f7f8fb}
-  header{background:#0d6efd;color:#fff;padding:12px 16px;font-weight:700}
-  .wrap{display:grid;grid-template-columns:360px 1fr;gap:12px;padding:12px}
-  .card{background:#fff;border:1px solid #e6e7eb;border-radius:12px;padding:14px;box-shadow:0 2px 10px rgba(0,0,0,.04)}
-  label{display:block;margin:10px 0 6px;font-weight:600}
-  input,select,button{width:100%;padding:10px;border-radius:8px;border:1px solid #cfd2d8}
-  button{background:#0d6efd;color:#fff;border:0;font-weight:700;cursor:pointer;margin-top:12px}
-  #map{width:100%;height:calc(100vh - 64px - 24px);border-radius:12px}
-  .kpi{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:10px}
-  .kpi div{background:#f2f4f8;border:1px solid #e6e7eb;border-radius:10px;padding:8px}
-  .muted{color:#6b7280}
-  .ok{color:#0a7c2f}
-  .err{color:#b00020}
-</style>
-</head>
-<body>
-<header>Metropolitano — Panel del Conductor</header>
-<div class="wrap">
-  <div class="card">
-    <h3>Configurar</h3>
-    <label for="device">ID del vehículo (opcional, pero recomendado)</label>
-    <input id="device" placeholder="ej: bus123"/>
+  res.send(`<!doctype html><html lang="es"><head>
+  <meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Panel del Conductor</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
+  <style>
+    *{box-sizing:border-box} body{font-family:system-ui,Arial;margin:0;background:#f7f8fb}
+    header{background:#0d6efd;color:#fff;padding:12px 16px;font-weight:700}
+    .wrap{display:grid;grid-template-columns:360px 1fr;gap:12px;padding:12px}
+    .card{background:#fff;border:1px solid #e6e7eb;border-radius:12px;padding:14px;box-shadow:0 2px 10px rgba(0,0,0,.04)}
+    label{display:block;margin:10px 0 6px;font-weight:600}
+    input,select,button{width:100%;padding:10px;border-radius:8px;border:1px solid #cfd2d8}
+    button{background:#0d6efd;color:#fff;border:0;font-weight:700;cursor:pointer;margin-top:12px}
+    #map{width:100%;height:calc(100vh - 64px - 24px);border-radius:12px}
+    .kpi{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:10px}
+    .kpi div{background:#f2f4f8;border:1px solid #e6e7eb;border-radius:10px;padding:8px}
+    .muted{color:#6b7280}.ok{color:#0a7c2f}.err{color:#b00020}
+  </style></head><body>
+  <header>Metropolitano — Panel del Conductor</header>
+  <div class="wrap">
+    <div class="card">
+      <h3>Configurar</h3>
+      <label for="device">ID del vehículo (opcional, recomendado)</label>
+      <input id="device" placeholder="ej: bus123" value="${pre}"/>
+      <label for="line">Línea</label><select id="line"></select>
+      <label for="dir">Dirección</label><select id="dir"></select>
+      <button id="save">Confirmar selección</button>
+      <div id="msg" class="muted"></div>
 
-    <label for="line">Línea</label>
-    <select id="line"></select>
+      <hr/><h3>Opciones del mapa</h3>
+      <label><input type="checkbox" id="showtrack" checked/> Mostrar recorrido</label>
 
-    <label for="dir">Dirección</label>
-    <select id="dir"></select>
-
-    <button id="save">Confirmar selección</button>
-    <div id="msg" class="muted"></div>
-
-    <hr/>
-    <h3>Opciones del mapa</h3>
-    <label><input type="checkbox" id="showtrack" checked/> Mostrar recorrido</label>
-
-    <hr/>
-    <h3>Estado en vivo</h3>
-    <div class="kpi">
-      <div><strong>Device:</strong> <span id="kDevice" class="muted">—</span></div>
-      <div><strong>Línea/Dir:</strong> <span id="kLineDir" class="muted">—</span></div>
-      <div><strong>Lat/Lon:</strong> <span id="kLatLon" class="muted">—</span></div>
-      <div><strong>Último fix:</strong> <span id="kAgo" class="muted">—</span></div>
-      <div><strong>Paradero cercano:</strong> <span id="kStop" class="muted">—</span></div>
+      <hr/><h3>Estado en vivo</h3>
+      <div class="kpi">
+        <div><strong>Device:</strong> <span id="kDevice" class="muted">—</span></div>
+        <div><strong>Línea/Dir:</strong> <span id="kLineDir" class="muted">—</span></div>
+        <div><strong>Lat/Lon:</strong> <span id="kLatLon" class="muted">—</span></div>
+        <div><strong>Último fix:</strong> <span id="kAgo" class="muted">—</span></div>
+        <div><strong>Paradero cercano:</strong> <span id="kStop" class="muted">—</span></div>
+      </div>
     </div>
+    <div class="card"><div id="map"></div></div>
   </div>
 
-  <div class="card"><div id="map"></div></div>
-</div>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+  <script>
+    const dirsByLine = ${JSON.stringify(dirsByLine)};
+    const DEFAULT_LINE_ID = ${JSON.stringify(DEFAULT_LINE_ID)};
+    const DEFAULT_DIR = ${JSON.stringify(DEFAULT_DIR)};
 
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
-<script>
-  const dirsByLine = ${JSON.stringify(dirsByLine)};
-  const DEFAULT_LINE_ID = ${JSON.stringify(DEFAULT_LINE_ID)};
-  const DEFAULT_DIR = ${JSON.stringify(DEFAULT_DIR)};
+    const $line=document.getElementById('line'), $dir=document.getElementById('dir');
+    const $dev=document.getElementById('device'), $btn=document.getElementById('save'), $msg=document.getElementById('msg');
+    const $kDevice=document.getElementById('kDevice'), $kLineDir=document.getElementById('kLineDir'),
+          $kLatLon=document.getElementById('kLatLon'), $kAgo=document.getElementById('kAgo'), $kStop=document.getElementById('kStop');
+    const $showtrack=document.getElementById('showtrack');
 
-  const $line = document.getElementById('line');
-  const $dir  = document.getElementById('dir');
-  const $dev  = document.getElementById('device');
-  const $btn  = document.getElementById('save');
-  const $msg  = document.getElementById('msg');
+    function fillLines(sel){ $line.innerHTML=''; Object.keys(dirsByLine).forEach(id=>{ const o=document.createElement('option'); o.value=id;o.textContent=id;if(id===sel)o.selected=true; $line.appendChild(o); }); }
+    function fillDirs(line,sel){ const dirs=dirsByLine[line]||[]; $dir.innerHTML=''; dirs.forEach(d=>{ const o=document.createElement('option'); o.value=d;o.textContent=d;if(d===sel)o.selected=true; $dir.appendChild(o);});}
 
-  const $kDevice = document.getElementById('kDevice');
-  const $kLineDir= document.getElementById('kLineDir');
-  const $kLatLon = document.getElementById('kLatLon');
-  const $kAgo    = document.getElementById('kAgo');
-  const $kStop   = document.getElementById('kStop');
-  const $showtrack = document.getElementById('showtrack');
+    const initial = Object.keys(dirsByLine).includes(DEFAULT_LINE_ID)?DEFAULT_LINE_ID:Object.keys(dirsByLine)[0];
+    fillLines(initial); fillDirs(initial,(dirsByLine[initial]||[]).includes(DEFAULT_DIR)?DEFAULT_DIR:dirsByLine[initial][0]);
 
-  function fillLines(selected){
-    $line.innerHTML='';
-    Object.keys(dirsByLine).forEach(id=>{
-      const opt=document.createElement('option');
-      opt.value=id; opt.textContent=id;
-      if(id===selected) opt.selected=true;
-      $line.appendChild(opt);
+    $line.addEventListener('change',()=>{ const id=$line.value; fillDirs(id, dirsByLine[id]?.[0]); loadStopsAndDraw(id,$dir.value); });
+    $dir.addEventListener('change', ()=> loadStopsAndDraw($line.value,$dir.value));
+
+    $btn.addEventListener('click', async ()=>{
+      const deviceId=$dev.value.trim()||'unknown', lineId=$line.value, dir=$dir.value;
+      $btn.disabled=true; $msg.textContent=''; $msg.className='muted';
+      try{
+        const r=await fetch('/set-line',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({deviceId,lineId,dir})});
+        const data=await r.json().catch(()=>({})); if(!r.ok) throw new Error(data.error||('HTTP '+r.status));
+        $msg.textContent='✅ Configurado'; $msg.className='ok'; $kDevice.textContent=deviceId; $kLineDir.textContent=lineId+' / '+dir; loadStopsAndDraw(lineId,dir);
+      }catch(e){ $msg.textContent='❌ '+e.message; $msg.className='err'; } finally{ $btn.disabled=false; }
     });
-  }
-  function fillDirs(lineId, selected){
-    const dirs = dirsByLine[lineId] || [];
-    $dir.innerHTML='';
-    dirs.forEach(d=>{
-      const opt=document.createElement('option');
-      opt.value=d; opt.textContent=d;
-      if(d===selected) opt.selected=true;
-      $dir.appendChild(opt);
-    });
-  }
 
-  const initialLine = Object.keys(dirsByLine).includes(DEFAULT_LINE_ID) ? DEFAULT_LINE_ID : Object.keys(dirsByLine)[0];
-  fillLines(initialLine);
-  fillDirs(initialLine, (dirsByLine[initialLine]||[]).includes(DEFAULT_DIR) ? DEFAULT_DIR : (dirsByLine[initialLine]||[])[0]);
+    // Mapa
+    let map=L.map('map').setView([-12.05749,-77.03599],12);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'&copy; OpenStreetMap contributors'}).addTo(map);
+    let stopsMarkers=[], polyLine=null, deviceMarker=null, trackLine=null;
 
-  $line.addEventListener('change', ()=>{
-    const id=$line.value;
-    fillDirs(id, dirsByLine[id]?.[0]);
-    loadStopsAndDraw(id, $dir.value);
-  });
-  $dir.addEventListener('change', ()=>{
-    loadStopsAndDraw($line.value, $dir.value);
-  });
-
-  $btn.addEventListener('click', async ()=>{
-    const deviceId = $dev.value.trim() || 'unknown';
-    const lineId   = $line.value;
-    const dir      = $dir.value;
-    $btn.disabled=true; $msg.textContent=''; $msg.className='muted';
-    try{
-      const r = await fetch('/set-line', { method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ deviceId, lineId, dir })
+    async function loadStopsAndDraw(lineId,dir){
+      try{
+        const r=await fetch('/stops?line='+encodeURIComponent(lineId)+'&dir='+encodeURIComponent(dir));
+        const data=await r.json(); if(!r.ok) throw new Error(data.error||('HTTP '+r.status)); drawStops(data.stops);
+      }catch(e){ console.error(e); }
+    }
+    function drawStops(stops){
+      stopsMarkers.forEach(m=>m.remove()); stopsMarkers=[]; if(polyLine){polyLine.remove(); polyLine=null;}
+      const latlngs=[], bounds=L.latLngBounds();
+      stops.forEach(s=>{ const pos=[s.lat,s.lon]; latlngs.push(pos); bounds.extend(pos);
+        const m=L.marker(pos,{title:s.name||s.id}).addTo(map); m.bindPopup('<strong>'+(s.name||s.id)+'</strong><br/><small>'+s.lat.toFixed(6)+', '+s.lon.toFixed(6)+'</small>'); stopsMarkers.push(m);
       });
-      const data = await r.json().catch(()=>({}));
-      if(!r.ok) throw new Error(data.error||('HTTP '+r.status));
-      $msg.textContent='✅ Configurado'; $msg.className='ok';
-      $kDevice.textContent = deviceId;
-      $kLineDir.textContent = lineId+' / '+dir;
-      loadStopsAndDraw(lineId, dir);
-    }catch(e){
-      $msg.textContent='❌ '+e.message; $msg.className='err';
-    }finally{$btn.disabled=false;}
-  });
+      if(latlngs.length>1) polyLine=L.polyline(latlngs,{weight:4,opacity:.9}).addTo(map);
+      if(latlngs.length) map.fitBounds(bounds.pad(0.2));
+    }
+    function prettyAgo(ts){ if(!ts) return '—'; const s=Math.max(0,Math.round((Date.now()-ts)/1000)); return s+' s'; }
+    function drawTrack(points){ if(trackLine){trackLine.remove(); trackLine=null;} if(!$showtrack.checked||!points||points.length<2) return; trackLine=L.polyline(points.map(p=>[p.lat,p.lon]),{weight:3,opacity:.7}).addTo(map); }
 
-  // ====== MAPA ======
-  let map = L.map('map').setView([-12.05749, -77.03599], 12);
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-    maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
-  }).addTo(map);
+    async function pollDevice(){
+      const id=($dev.value.trim()||'unknown');
+      try{
+        const r=await fetch('/device?deviceId='+encodeURIComponent(id)); const d=await r.json(); if(!d.found) return;
+        $kDevice.textContent=id; $kLineDir.textContent=(d.lineId||'—')+' / '+(d.dir||'—');
+        if(typeof d.lastLat==='number' && typeof d.lastLon==='number'){
+          $kLatLon.textContent=d.lastLat.toFixed(6)+', '+d.lastLon.toFixed(6);
+          const pos=[d.lastLat,d.lastLon];
+          if(!deviceMarker){ deviceMarker=L.circleMarker(pos,{radius:6}).addTo(map).bindTooltip('Vehículo: '+id); } else { deviceMarker.setLatLng(pos); }
+        } else $kLatLon.textContent='—';
+        $kAgo.textContent=prettyAgo(d.lastSeenTs||(d.lastSeen?Date.parse(d.lastSeen):null));
+        $kStop.textContent=d.snappedStopName||d.snappedStopId||'—';
+      }catch(e){}
+    }
+    async function pollTrack(){
+      const id=($dev.value.trim()||'unknown');
+      try{ const r=await fetch('/track?deviceId='+encodeURIComponent(id)+'&minutes=60'); const data=await r.json(); drawTrack(data); }catch(e){}
+    }
 
-  let stopsMarkers=[]; let polyLine=null; let deviceMarker=null; let trackLine=null;
-
-  async function loadStopsAndDraw(lineId, dir){
-    try{
-      const r = await fetch('/stops?line='+encodeURIComponent(lineId)+'&dir='+encodeURIComponent(dir));
-      const data = await r.json();
-      if(!r.ok) throw new Error(data.error||('HTTP '+r.status));
-      drawStops(data.stops);
-    }catch(e){ console.error(e); }
-  }
-  function drawStops(stops){
-    stopsMarkers.forEach(m=>m.remove()); stopsMarkers=[];
-    if(polyLine){ polyLine.remove(); polyLine=null; }
-    const latlngs=[]; const bounds=L.latLngBounds();
-    stops.forEach(s=>{
-      const pos=[s.lat,s.lon]; latlngs.push(pos); bounds.extend(pos);
-      const m=L.marker(pos,{title:s.name||s.id}).addTo(map);
-      m.bindPopup('<strong>'+(s.name||s.id)+'</strong><br/><small>'+s.lat.toFixed(6)+', '+s.lon.toFixed(6)+'</small>');
-      stopsMarkers.push(m);
-    });
-    if(latlngs.length>1){ polyLine = L.polyline(latlngs,{weight:4,opacity:.9}).addTo(map); }
-    if(latlngs.length){ map.fitBounds(bounds.pad(0.2)); }
-  }
-
-  function prettyAgo(ts){
-    if(!ts) return '—';
-    const s = Math.max(0, Math.round((Date.now()-ts)/1000));
-    return s+' s';
-  }
-
-  function drawTrack(points){
-    if(trackLine){ trackLine.remove(); trackLine=null; }
-    if(!$showtrack.checked || !points || points.length<2) return;
-    const latlngs = points.map(p => [p.lat, p.lon]);
-    trackLine = L.polyline(latlngs, { weight:3, opacity:0.7 }).addTo(map);
-  }
-
-  async function pollDevice(){
-    const id = ($dev.value.trim() || 'unknown');
-    try{
-      const r = await fetch('/device?deviceId='+encodeURIComponent(id));
-      const d = await r.json();
-      if(!d.found) return;
-
-      $kDevice.textContent = id;
-      $kLineDir.textContent = (d.lineId||'—')+' / '+(d.dir||'—');
-      if(typeof d.lastLat==='number' && typeof d.lastLon==='number'){
-        $kLatLon.textContent = d.lastLat.toFixed(6)+', '+d.lastLon.toFixed(6);
-        const pos=[d.lastLat,d.lastLon];
-        if(!deviceMarker){
-          deviceMarker=L.circleMarker(pos,{radius:6}).addTo(map).bindTooltip('Vehículo: '+id);
-        }else{
-          deviceMarker.setLatLng(pos);
-        }
-      }else{
-        $kLatLon.textContent='—';
-      }
-      $kAgo.textContent  = prettyAgo(d.lastSeenTs || (d.lastSeen? Date.parse(d.lastSeen): null));
-      $kStop.textContent = d.snappedStopName || d.snappedStopId || '—';
-    }catch(e){}
-  }
-
-  async function pollTrack(){
-    const id = ($dev.value.trim() || 'unknown');
-    try{
-      const r = await fetch('/track?deviceId='+encodeURIComponent(id)+'&minutes=60');
-      const data = await r.json();
-      drawTrack(data);
-    }catch(e){}
-  }
-
-  // Inicial
-  loadStopsAndDraw($line.value, $dir.value);
-  setInterval(pollDevice, 2000);
-  setInterval(pollTrack, 5000);
-</script>
-</body></html>`);
+    loadStopsAndDraw($line.value,$dir.value);
+    setInterval(pollDevice,2000);
+    setInterval(pollTrack,5000);
+  </script></body></html>`);
 });
 
 // Aliases
 app.get(['/controlador','/conductor','/panel'], (req,res)=>res.redirect('/driver'));
 
-// Stops
+// Paraderos
 app.get('/stops', (req,res)=>{
-  const lineId=req.query.line||DEFAULT_LINE_ID;
-  const dir=req.query.dir||DEFAULT_DIR;
-  const L=LINES[normId(lineId)];
-  if(!L) return res.status(400).json({error:'line inválida'});
-  const stops=L[normId(dir)];
-  if(!stops) return res.status(400).json({error:'dir inválida'});
+  const lineId = req.query.line || DEFAULT_LINE_ID;
+  const dir = req.query.dir || DEFAULT_DIR;
+  const L = LINES[normId(lineId)];
+  if (!L) return res.status(400).json({error:'line inválida'});
+  const stops = L[normId(dir)];
+  if (!stops) return res.status(400).json({error:'dir inválida'});
   res.json({ lineId:normId(lineId), dir:normId(dir), stops });
 });
 
-// Track (recorrido reciente)
+// Recorrido (últimos minutos)
 app.get('/track', (req,res)=>{
   const id = (req.query.deviceId || '').toString();
-  if(!id) return res.status(400).json({error:'deviceId requerido'});
+  if (!id) return res.status(400).json({error:'deviceId requerido'});
   const arr = tracks.get(id) || [];
-  const minutes = Number(req.query.minutes || 0);
-  if(minutes>0){
+  const minutes = Math.max(0, Math.min(720, Number(req.query.minutes || 0))); // máx 12h
+  if (minutes > 0){
     const cutoff = Date.now() - minutes*60*1000;
     return res.json(arr.filter(p => p.t >= cutoff));
   }
   res.json(arr);
 });
 
-// Device quick state
+// Estado rápido de un device
 app.get('/device', (req,res)=>{
-  const id=(req.query.deviceId||'').toString();
-  if(!id) return res.status(400).json({error:'deviceId requerido'});
-  const st=deviceState.get(id);
-  if(!st) return res.json({found:false});
+  const id = (req.query.deviceId || '').toString();
+  if (!id) return res.status(400).json({error:'deviceId requerido'});
+  const st = deviceState.get(id);
+  if (!st) return res.json({found:false});
   res.json({
     found:true,
     deviceId:id,
@@ -431,55 +334,70 @@ app.get('/device', (req,res)=>{
   });
 });
 
-// Asignar línea/dirección
-app.post('/set-line',(req,res)=>{
-  const { deviceId='unknown', lineId=DEFAULT_LINE_ID, dir=DEFAULT_DIR } = req.body||{};
-  if(!LINES[normId(lineId)]) return res.status(400).json({error:'lineId inválido'});
-  if(!LINES[normId(lineId)][normId(dir)]) return res.status(400).json({error:'dir inválida'});
-  const st=deviceState.get(deviceId)||{};
-  st.lineId=normId(lineId); st.dir=normId(dir);
-  deviceState.set(deviceId,st);
-  res.json({ok:true, deviceId, lineId:st.lineId, dir:st.dir});
+// Set línea/dirección
+app.post('/set-line', (req,res)=>{
+  const { deviceId='unknown', lineId=DEFAULT_LINE_ID, dir=DEFAULT_DIR } = req.body || {};
+  if (!LINES[normId(lineId)]) return res.status(400).json({error:'lineId inválido'});
+  if (!LINES[normId(lineId)][normId(dir)]) return res.status(400).json({error:'dir inválida'});
+  const st = deviceState.get(deviceId) || {};
+  st.lineId = normId(lineId);
+  st.dir = normId(dir);
+  deviceState.set(deviceId, st);
+  res.json({ ok:true, deviceId, lineId:st.lineId, dir:st.dir });
 });
 
-// Telemetría del bus
+// Telemetría
 // body: { deviceId, lat, lon, (opt) alt, sats, hdop, speedKmh, lineId, dir }
-app.post('/telemetry',(req,res)=>{
-  const { deviceId='unknown', lat, lon, alt, sats, hdop, speedKmh, lineId, dir } = req.body||{};
-  if(lat==null || lon==null) return res.sendStatus(400);
+app.post('/telemetry', (req,res)=>{
+  const { deviceId='unknown', lat, lon, alt, sats, hdop, speedKmh, lineId, dir } = req.body || {};
+  if (lat==null || lon==null) return res.sendStatus(400);
 
-  const st=deviceState.get(deviceId)||{ lineId:DEFAULT_LINE_ID, dir:DEFAULT_DIR };
-  if(lineId && LINES[normId(lineId)]) st.lineId=normId(lineId);
-  if(dir && LINES[st.lineId]?.[normId(dir)]) st.dir=normId(dir);
+  const st = deviceState.get(deviceId) || { lineId:DEFAULT_LINE_ID, dir:DEFAULT_DIR };
+  if (lineId && LINES[normId(lineId)]) st.lineId = normId(lineId);
+  if (dir && LINES[st.lineId]?.[normId(dir)]) st.dir = normId(dir);
 
-  st.lastLat=Number(lat); st.lastLon=Number(lon);
-  if(alt!==undefined) st.alt=Number(alt);
-  if(sats!==undefined) st.sats=Number(sats);
-  if(hdop!==undefined) st.hdop=Number(hdop);
-  if(speedKmh!==undefined) st.speedKmh=Number(speedKmh);
-  st.lastSeen=Date.now();
+  st.lastLat = Number(lat);
+  st.lastLon = Number(lon);
+  if (alt!==undefined)  st.alt  = Number(alt);
+  if (sats!==undefined) st.sats = Number(sats);
+  if (hdop!==undefined) st.hdop = Number(hdop);
+  if (speedKmh!==undefined) st.speedKmh = Number(speedKmh);
+  st.lastSeen = Date.now();
 
-  // Geofencing y promedios
-  const near=nearestStopInLine(st.lineId, st.dir, st.lastLat, st.lastLon);
-  if(near && near.distance<=GEOFENCE_RADIUS_M){
-    if(st.lastStopId && normId(st.lastStopId)!==normId(near.id) && st.lastStopTime){
-      const dtSec=Math.max(1, Math.round((Date.now()-st.lastStopTime)/1000));
+  const near = nearestStopInLine(st.lineId, st.dir, st.lastLat, st.lastLon);
+  if (near && near.distance <= GEOFENCE_RADIUS_M){
+    if (st.lastStopId && normId(st.lastStopId)!==normId(near.id) && st.lastStopTime){
+      const dtSec = Math.max(1, Math.round((Date.now()-st.lastStopTime)/1000));
       updateSegmentAvg(st.lineId, st.dir, st.lastStopId, near.id, dtSec);
     }
-    st.lastStopId=near.id; st.lastStopName=near.name; st.lastStopTime=Date.now();
+    st.lastStopId = near.id; st.lastStopName = near.name; st.lastStopTime = Date.now();
   }
 
-  // Guardar punto en track
   pushTrack(deviceId, st.lastLat, st.lastLon);
+  deviceState.set(deviceId, st);
 
-  deviceState.set(deviceId,st);
+  // Log claro en español
+  console.log('📡  RX {'
+    + `\n  ID del dispositivo: '${deviceId}',`
+    + `\n  línea:              '${st.lineId}',`
+    + `\n  dirección:          '${st.dir}',`
+    + `\n  latitud:            ${st.lastLat.toFixed(6)},`
+    + `\n  longitud:           ${st.lastLon.toFixed(6)},`
+    + `\n  alt(m):             ${st.alt ?? 'nulo'},`
+    + `\n  sats:               ${st.sats ?? 'nulo'},`
+    + `\n  hdop:               ${st.hdop ?? 'nulo'},`
+    + `\n  vel(km/h):          ${st.speedKmh ?? 'nulo'},`
+    + `\n  paradero:           ${st.lastStopName ?? 'nulo'},`
+    + `\n  distM:              ${near ? Math.round(near.distance) : 'nulo'}`
+    + '\n}');
+
   res.sendStatus(200);
 });
 
-// Estado general
-app.get('/state',(req,res)=>{
-  const devices=[];
-  for(const [id,st] of deviceState.entries()){
+// Estado global
+app.get('/state', (req,res)=>{
+  const devices = [];
+  for (const [id,st] of deviceState.entries()){
     devices.push({
       deviceId:id, lineId:st.lineId, dir:st.dir,
       lastSeen: st.lastSeen ? new Date(st.lastSeen).toISOString() : null,
