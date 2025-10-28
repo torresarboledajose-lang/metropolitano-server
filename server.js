@@ -72,7 +72,7 @@ const LINES = {
     ]
   },
 
-  // Expreso 1: Central ↔ Matellini (tu lista)
+  // Expreso 1: Central ↔ Matellini
   expreso_1: {
     norte_sur: [
       { id: 'central',          name: 'Estación Central',           lat: -12.05749, lon: -77.03599 },
@@ -102,15 +102,8 @@ const LINES = {
 };
 
 // ======= ESTADO EN MEMORIA =======
-/*
- deviceState: deviceId -> {
-   lineId, dir, lastSeen, lastLat, lastLon,
-   lastStopId, lastStopTime, lastStopName
- }
- segmentStats: (lineId|dir|segment) -> { count, avgSec }
-*/
-const deviceState = new Map();
-const segmentStats = new Map(); // clave: `${lineId}|${dir}|${a}->${b}`
+const deviceState = new Map();  // deviceId -> estado
+const segmentStats = new Map(); // `${line}|${dir}|${a}->${b}` -> { count, avgSec }
 
 // ======= UTILIDADES =======
 function toRad(d){ return d*Math.PI/180; }
@@ -167,7 +160,6 @@ function estimateETA(lineId, dir, fromId, toId){
       total += stat.avgSec;
       detail.push({a,b,sec:Math.round(stat.avgSec),source:'avg'});
     }else{
-      // Heurística por distancia si no hay datos
       const dist = haversineMeters(stops[i], stops[i+1]); // m
       const v = 20000/3600; // 20 km/h en m/s
       const est = dist/v;
@@ -197,7 +189,7 @@ app.get('/',(req,res)=>{
   `);
 });
 
-// UI para el chofer: selección de línea y dirección + MAPA (Leaflet sin API key)
+// UI + MAPA (Leaflet sin API key)
 app.get('/driver', (req, res) => {
   const q = req.query || {};
   const preDevice = (q.deviceId || '').toString();
@@ -409,7 +401,12 @@ app.get('/driver', (req, res) => {
 </html>`);
 });
 
-// Paraderos de una línea/dirección (para la UI)
+// Alias: /controlador, /conductor, /panel  -> redirigen a /driver
+app.get(['/controlador', '/conductor', '/panel'], (req, res) => {
+  res.redirect('/driver');
+});
+
+// Paraderos de una línea/dirección
 app.get('/stops', (req, res) => {
   const lineId = req.query.line || DEFAULT_LINE_ID;
   const dir    = req.query.dir  || DEFAULT_DIR;
@@ -420,7 +417,7 @@ app.get('/stops', (req, res) => {
   res.json({ lineId: normId(lineId), dir: normId(dir), stops });
 });
 
-// Devuelve estado de un solo device (para localizar en el mapa)
+// Ubicación de un device (para el punto en el mapa)
 app.get('/device', (req,res)=>{
   const id = (req.query.deviceId || '').toString();
   if(!id) return res.status(400).json({error:'deviceId requerido'});
